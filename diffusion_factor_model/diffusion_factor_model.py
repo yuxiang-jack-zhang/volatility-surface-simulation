@@ -451,6 +451,7 @@ class ConditionalTransformer(Module):
         use_alibi=False,
         alibi_slope=1.0,
         first_token_bias=0.0,
+        state_shape=None,
     ):
         super().__init__()
         self.seq_len = seq_len
@@ -458,7 +459,9 @@ class ConditionalTransformer(Module):
         self.use_alibi = use_alibi
         self.alibi_slope = alibi_slope
         self.first_token_bias = first_token_bias
-        self.value_proj = nn.Linear(1, dim)
+        self.state_shape = tuple(state_shape) if state_shape is not None else ()
+        self.state_dim = int(np.prod(self.state_shape)) if len(self.state_shape) > 0 else 1
+        self.value_proj = nn.Linear(self.state_dim, dim)
         self.indicator_embed = nn.Embedding(2, dim)
         self.time_mlp = nn.Sequential(
             SinusoidalPosEmb(dim),
@@ -502,23 +505,39 @@ class ConditionalTransformer(Module):
             nn.SiLU(),
             nn.Linear(dim, dim),
             nn.SiLU(),
-            nn.Linear(dim, 1)
+            nn.Linear(dim, self.state_dim)
         )
+
+    def _flatten_states(self, values):
+        if values.ndim < 2:
+            raise ValueError('values must have shape [batch, seq_len, ...]')
+        if values.ndim == 2:
+            values = values.unsqueeze(-1)
+        batch, seq_len = values.shape[:2]
+        values = values.reshape(batch, seq_len, -1)
+        if values.shape[-1] != self.state_dim:
+            raise ValueError(
+                f'expected per-step state dimension {self.state_dim}, got {values.shape[-1]}. '
+                'Set `state_shape` to match your data.'
+            )
+        return values
 
     def forward(self, values, target_indices, timesteps, key_padding_mask):
         """Forward pass.
 
         Args:
-            values: Tensor of shape [batch, seq_len] containing history and noisy entry.
+            values: Tensor of shape [batch, seq_len, ...] containing history and noisy entry.
             target_indices: Long tensor [batch] for the index of the noisy entry.
             timesteps: Long tensor [batch] for diffusion step.
             key_padding_mask: Bool tensor [batch, seq_len] masking padded entries (True => ignore).
         Returns:
-            Predicted noise scalar for each batch element.
+            Predicted noise tensor for each batch element with shape [batch, *state_shape]
+            (or [batch] when state_shape is empty).
         """
-        batch, seq_len = values.shape
+        values = self._flatten_states(values)
+        batch, seq_len, _ = values.shape
         device = values.device
-        tokens = self.value_proj(values.unsqueeze(-1))
+        tokens = self.value_proj(values)
         offset = 1 if self.use_bos_token else 0
         if self.use_bos_token:
             bos = self.bos_token.expand(batch, -1, -1)
@@ -540,7 +559,10 @@ class ConditionalTransformer(Module):
             key_padding_mask = F.pad(key_padding_mask, (1, 0), value=False)
         encoded = self.encoder(tokens, mask=mask, src_key_padding_mask=key_padding_mask)
         target_states = encoded[torch.arange(batch, device=device), target_indices + offset]
-        return self.output(target_states).squeeze(-1)
+        pred = self.output(target_states)
+        if len(self.state_shape) == 0:
+            return pred.squeeze(-1)
+        return pred.view(batch, *self.state_shape)
 
 # gaussian diffusion trainer class
 
@@ -1190,11 +1212,14 @@ class SequentialGaussianDiffusion(Module):
         beta_schedule='cosine',
         schedule_fn_kwargs=dict(),
         auto_normalize=False,
+        state_shape=None,
     ):
         super().__init__()
         self.model = model
         self.seq_len = seq_len
         self.objective = objective
+        inferred_state_shape = getattr(model, 'state_shape', ())
+        self.state_shape = tuple(state_shape) if state_shape is not None else tuple(inferred_state_shape)
 
         if beta_schedule == 'linear':
             beta_schedule_fn = linear_beta_schedule
@@ -1255,12 +1280,14 @@ class SequentialGaussianDiffusion(Module):
 
     def build_context(self, sequences, target_indices, target_values):
         device = sequences.device
-        batch, seq_len = sequences.shape
+        batch, seq_len = sequences.shape[:2]
         arange = torch.arange(seq_len, device=device)
         prefix_mask = arange.unsqueeze(0) < target_indices.unsqueeze(1)
+        while prefix_mask.ndim < sequences.ndim:
+            prefix_mask = prefix_mask.unsqueeze(-1)
         context = torch.zeros_like(sequences)
         context = torch.where(prefix_mask, sequences, context)
-        context.scatter_(1, target_indices.unsqueeze(1), target_values.unsqueeze(1))
+        context[torch.arange(batch, device=device), target_indices] = target_values
         key_padding_mask = arange.unsqueeze(0) > target_indices.unsqueeze(1)
         return context, key_padding_mask
 
@@ -1311,8 +1338,8 @@ class SequentialGaussianDiffusion(Module):
 
     def p_losses(self, sequences, t, target_indices, noise=None):
         batch = sequences.shape[0]
-        noise = default(noise, lambda: torch.randn(batch, device=self.device))
         target = sequences[torch.arange(batch, device=self.device), target_indices]
+        noise = default(noise, lambda: torch.randn_like(target))
         noisy_target = self.q_sample(target, t, noise)
         context, key_padding_mask = self.build_context(sequences, target_indices, noisy_target)
         pred = self.model(context, target_indices, t, key_padding_mask)
@@ -1328,8 +1355,18 @@ class SequentialGaussianDiffusion(Module):
         return loss.mean()
 
     def forward(self, sequences, *args, **kwargs):
-        batch, seq_len = sequences.shape
+        batch, seq_len = sequences.shape[:2]
         assert seq_len == self.seq_len, f'sequence length must be {self.seq_len}'
+        expected_ndim = 2 + len(self.state_shape)
+        if sequences.ndim != expected_ndim:
+            raise ValueError(
+                f'expected input shape [batch, seq_len, *state_shape] with {expected_ndim} dimensions, '
+                f'got {sequences.shape}'
+            )
+        if len(self.state_shape) > 0 and tuple(sequences.shape[2:]) != self.state_shape:
+            raise ValueError(
+                f'expected trailing shape {self.state_shape}, got {tuple(sequences.shape[2:])}'
+            )
         t = torch.randint(0, self.num_timesteps, (batch,), device=sequences.device).long()
         target_indices = torch.randint(0, self.seq_len, (batch,), device=sequences.device).long()
         return self.p_losses(sequences, t, target_indices, *args, **kwargs)
@@ -1366,7 +1403,7 @@ class SequentialGaussianDiffusion(Module):
 
     def _ddpm_step(self, sequences, pos):
         batch_size = sequences.size(0)
-        x_t = torch.randn(batch_size, device=self.device)
+        x_t = torch.randn((batch_size, *self.state_shape), device=self.device)
         target_indices = torch.full((batch_size,), pos, device=self.device, dtype=torch.long)
         for t in reversed(range(self.num_timesteps)):
             times = torch.full((batch_size,), t, device=self.device, dtype=torch.long)
@@ -1388,7 +1425,7 @@ class SequentialGaussianDiffusion(Module):
 
     def _ddim_step(self, sequences, pos):
         batch_size = sequences.size(0)
-        x_t = torch.randn(batch_size, device=self.device)
+        x_t = torch.randn((batch_size, *self.state_shape), device=self.device)
         target_indices = torch.full((batch_size,), pos, device=self.device, dtype=torch.long)
         time_pairs = self._build_ddim_time_pairs()
 
@@ -1441,25 +1478,28 @@ class SequentialGaussianDiffusion(Module):
                 stacklevel=2,
             )
 
-        sequences = torch.zeros(batch_size, self.seq_len, device=self.device)
+        sequences = torch.zeros((batch_size, self.seq_len, *self.state_shape), device=self.device)
         if conditioning is not None:
             conditioning = conditioning.to(self.device)
-            if conditioning.dim() == 1:
+            if conditioning.dim() == 1 + len(self.state_shape):
                 conditioning = conditioning.unsqueeze(0)
             if conditioning.shape != sequences.shape:
                 raise ValueError(
-                    "conditioning must have shape [batch_size, seq_len] or [seq_len]"
+                    "conditioning must have shape [batch_size, seq_len, *state_shape] or [seq_len, *state_shape]"
                 )
             if conditioning_mask is None:
                 raise ValueError("conditioning_mask is required when conditioning is provided")
             if conditioning_mask.dim() == 1:
-                conditioning_mask = conditioning_mask.unsqueeze(0).expand_as(sequences)
-            if conditioning_mask.shape != sequences.shape:
-                raise ValueError("conditioning_mask must match conditioning shape")
+                conditioning_mask = conditioning_mask.unsqueeze(0).expand(batch_size, -1)
+            if conditioning_mask.shape != sequences.shape[:2]:
+                raise ValueError("conditioning_mask must have shape [batch_size, seq_len] or [seq_len]")
             conditioning_mask = conditioning_mask.bool()
             if not (conditioning_mask == conditioning_mask[0]).all():
                 raise ValueError("conditioning_mask must be identical across the batch")
-            sequences = torch.where(conditioning_mask, conditioning, sequences)
+            mask = conditioning_mask
+            while mask.ndim < sequences.ndim:
+                mask = mask.unsqueeze(-1)
+            sequences = torch.where(mask, conditioning, sequences)
         elif conditioning_mask is not None:
             raise ValueError("conditioning_mask provided without conditioning values")
         sample_pos = self._ddim_step if self.is_ddim_sampling else self._ddpm_step
@@ -1700,6 +1740,7 @@ class Trainer:
             update_pbar_batches = total_batches  # // 2
             grad_norm_total = 0.0
             grad_norm_count = 0
+            latest_grad_norm = 0.0
             # Update scheduler for each epoch
             self.scheduler.step(epoch)
             
@@ -1716,8 +1757,15 @@ class Trainer:
                     num_batches += 1
 
                     # Update model parameters after accumulating `gradient_accumulate_every` batches
-                    if (batch_idx + 1) % self.gradient_accumulate_every == 0:
-                        self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                    should_step = (batch_idx + 1) % self.gradient_accumulate_every == 0
+                    is_last_batch = (batch_idx + 1) == total_batches
+                    if should_step or is_last_batch:
+                        grad_norm = self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                        grad_norm_value = grad_norm.item() if torch.is_tensor(grad_norm) else float(grad_norm)
+                        if math.isfinite(grad_norm_value):
+                            grad_norm_total += grad_norm_value
+                            grad_norm_count += 1
+                            latest_grad_norm = grad_norm_value
                         self.optimizer.step()
                         self.optimizer.zero_grad()
 
@@ -1729,7 +1777,7 @@ class Trainer:
 
                     # Update progress bar and display loss only when update_pbar_batches is reached
                     if (batch_idx + 1) % update_pbar_batches == 0:
-                        pbar.set_postfix(loss=total_loss / num_batches)
+                        pbar.set_postfix(loss=total_loss / num_batches, grad_norm=latest_grad_norm)
                         pbar.update(update_pbar_batches)
 
                 # Log metrics at the end of the epoch
@@ -1737,6 +1785,7 @@ class Trainer:
                 avg_grad_norm = grad_norm_total / grad_norm_count if grad_norm_count else 0.0
 
                 self.logger.add_scalar('Train/Average Loss', avg_train_loss, epoch)
+                self.logger.add_scalar('Train/Average Grad Norm', avg_grad_norm, epoch)
                 self.logger.flush()
 
                 self.accelerator.print(
@@ -1792,11 +1841,27 @@ class Trainer:
                 self.ema.ema_model.eval()
                 with torch.no_grad():
                     # Pass save_timesteps parameter for early stopping evaluation
-                    samples = self.ema.ema_model.sample(self.num_new_samples, save_timesteps=self.save_timesteps)
+                    try:
+                        samples = self.ema.ema_model.sample(
+                            self.num_new_samples,
+                            save_timesteps=self.save_timesteps,
+                            show_progress=True,
+                            progress_desc=f"Sampling (EMA, epoch {epoch+1})",
+                        )
+                    except TypeError:
+                        samples = self.ema.ema_model.sample(self.num_new_samples, save_timesteps=self.save_timesteps)
             else:
                 with torch.no_grad():
                     # Pass save_timesteps parameter for early stopping evaluation
-                    samples = self.model.sample(self.num_new_samples, save_timesteps=self.save_timesteps)
+                    try:
+                        samples = self.model.sample(
+                            self.num_new_samples,
+                            save_timesteps=self.save_timesteps,
+                            show_progress=True,
+                            progress_desc=f"Sampling (epoch {epoch+1})",
+                        )
+                    except TypeError:
+                        samples = self.model.sample(self.num_new_samples, save_timesteps=self.save_timesteps)
             
             samples_path = self.checkpoint_folder / f"fid_samples-epoch-{epoch+1}.pt"
             
