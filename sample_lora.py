@@ -93,7 +93,7 @@ def main():
 
     diffusion = build_model(seq_len, state_shape).to(device)
 
-    ckpt = torch.load(args.checkpoint, map_location=device)
+    ckpt = torch.load(args.checkpoint, map_location=device, weights_only=True)
     state = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
 
     ckpt_rank = None

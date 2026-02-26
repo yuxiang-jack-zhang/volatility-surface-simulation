@@ -340,7 +340,7 @@ class OnlineDDPMLoRAFineTuner:
 
         chunk_size = self.transition_chunk_size if self.transition_chunk_size > 0 else len(transitions)
         total_kl = None
-        num_transitions = 0
+
 
         for start_idx in range(0, len(transitions), chunk_size):
             chunk = transitions[start_idx:start_idx + chunk_size]
@@ -375,9 +375,9 @@ class OnlineDDPMLoRAFineTuner:
                 total_kl = kl.sum()
             else:
                 total_kl = total_kl + kl.sum()
-            num_transitions += kl.shape[0]
 
-        return total_kl / num_transitions
+
+        return total_kl
 
     def step(self, batch_size: int, reward_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None) -> FineTuneStats:
         reward_fn = reward_fn or self.reward_fn
@@ -399,7 +399,7 @@ class OnlineDDPMLoRAFineTuner:
         if self.normalize_rewards:
             rewards = (rewards - rewards.mean()) / (rewards.std(unbiased=False) + 1e-6)
 
-        kl_sum = self._compute_kl_only(transitions)
+        # kl_sum = self._compute_kl_only(transitions)
 
         reward_loss = -rewards.mean()
         kl_loss = self._compute_kl(transitions)

@@ -108,7 +108,6 @@ def main():
     parser.add_argument("--results_root", type=str, default=None)
     parser.add_argument("--gradient_mode", type=str, default="hybrid", choices=["direct", "reinforce", "hybrid"])
     parser.add_argument("--strict_grid_match", action="store_true", help="Require grid_size to match generated surface resolution")
-    parser.add_argument("--transition_chunk_size", type=int, default=0, help="Chunk size for parallel transition KL/log-prob eval; 0 uses all transitions")
     args = parser.parse_args()
 
     timestamp = int(time.time())
@@ -155,6 +154,7 @@ def main():
         max_grad_norm=args.max_grad_norm,
         transition_chunk_size=args.transition_chunk_size,
         device=device,
+        normalize_rewards=False,
     )
 
     writer = SummaryWriter(log_dir=run_dir / "tb")
