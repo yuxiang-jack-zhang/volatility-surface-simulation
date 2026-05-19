@@ -677,7 +677,8 @@ class TransactionCostLassoResult:
     phi: np.ndarray
     trade: np.ndarray
     alpha: float
-    g0: float
+    intercept: float  # A_t from paper eq.(20): unpenalized, estimated jointly with phi
+    g0_scale: float   # g_0 from paper eq.(20): initial gross position = V_t
     objective_value: float
     fit_loss: float
     transaction_penalty: float
@@ -724,14 +725,14 @@ def _validate_lasso_inputs(
     phi_prev: np.ndarray | Iterable[float],
     c_i: np.ndarray | Iterable[float],
     alpha: float,
-    g0: float,
+    g0_scale: float,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float, float]:
     y = _as_float_vector(target_changes, "target_changes")
     x = _as_float_matrix(hedge_changes, "hedge_changes")
     phi_prev_arr = _as_float_vector(phi_prev, "phi_prev")
     costs = _as_float_vector(c_i, "c_i")
     alpha = float(alpha)
-    g0 = float(g0)
+    g0_scale = float(g0_scale)
     if x.shape[0] != y.shape[0]:
         raise ValueError("target_changes and hedge_changes must have the same scenario count")
     if x.shape[1] != phi_prev_arr.shape[0]:
@@ -744,9 +745,9 @@ def _validate_lasso_inputs(
         raise ValueError("c_i half-spread costs must be nonnegative")
     if alpha < 0 or not np.isfinite(alpha):
         raise ValueError("alpha must be a finite nonnegative scalar")
-    if not np.isfinite(g0):
-        raise ValueError("g0 must be finite")
-    return y, x, phi_prev_arr, costs, alpha, g0
+    if not np.isfinite(g0_scale) or g0_scale <= 0:
+        raise ValueError("g0_scale must be a positive finite scalar")
+    return y, x, phi_prev_arr, costs, alpha, g0_scale
 
 
 def _transaction_cost_lasso_components(
@@ -756,18 +757,20 @@ def _transaction_cost_lasso_components(
     phi_prev: np.ndarray | Iterable[float],
     c_i: np.ndarray | Iterable[float],
     alpha: float,
-    g0: float,
+    g0_scale: float,
+    intercept: float = 0.0,
 ) -> tuple[float, float, float]:
-    y, x, phi_prev_arr, costs, alpha, g0 = _validate_lasso_inputs(
-        target_changes, hedge_changes, phi_prev, c_i, alpha, g0
+    # Paper eq.(20): (1/N) sum_k [DV^k - A_t - sum_i phi_i DH_i^k]^2 + alpha*g0*sum_i c_i|trade_i|
+    y, x, phi_prev_arr, costs, alpha, g0_scale = _validate_lasso_inputs(
+        target_changes, hedge_changes, phi_prev, c_i, alpha, g0_scale
     )
     phi_arr = _as_float_vector(phi, "phi")
     if phi_arr.shape[0] != phi_prev_arr.shape[0]:
         raise ValueError("phi length must match phi_prev length")
 
-    residual = y - g0 - x @ phi_arr
-    fit_loss = 0.5 * float(np.mean(residual * residual))
-    transaction_penalty = float(alpha * np.sum(costs * np.abs(phi_arr - phi_prev_arr)))
+    residual = y - float(intercept) - x @ phi_arr
+    fit_loss = float(np.mean(residual * residual))
+    transaction_penalty = float(alpha * g0_scale * np.sum(costs * np.abs(phi_arr - phi_prev_arr)))
     objective_value = fit_loss + transaction_penalty
     return objective_value, fit_loss, transaction_penalty
 
@@ -779,17 +782,18 @@ def transaction_cost_lasso_objective(
     phi_prev: np.ndarray | Iterable[float],
     c_i: np.ndarray | Iterable[float],
     alpha: float,
-    g0: float = 0.0,
+    g0_scale: float = 1.0,
+    intercept: float = 0.0,
 ) -> float:
-    """Return 0.5 MSE plus weighted L1 transaction cost on trade increments.
+    """Return MSE plus weighted L1 transaction cost on trade increments.
 
-    The fitted hedge is ``g0 + hedge_changes @ phi``. The transaction-cost
-    penalty is ``alpha * sum_i c_i * abs(phi_i - phi_prev_i)`` and is therefore
-    applied to the trade from the previous hedge, not to absolute holdings.
+    Implements paper eq.(20): (1/N) sum_k [DV^k - intercept - sum_i phi_i DH_i^k]^2
+    + alpha * g0_scale * sum_i c_i * |phi_i - phi_prev_i|.
+    intercept is A_t (estimated jointly); g0_scale is g_0 = V_t.
     """
 
     objective_value, _, _ = _transaction_cost_lasso_components(
-        target_changes, hedge_changes, phi, phi_prev, c_i, alpha, g0
+        target_changes, hedge_changes, phi, phi_prev, c_i, alpha, g0_scale, intercept
     )
     return objective_value
 
@@ -800,19 +804,21 @@ def solve_transaction_cost_lasso(
     phi_prev: np.ndarray | Iterable[float],
     c_i: np.ndarray | Iterable[float],
     alpha: float,
-    g0: float = 0.0,
+    g0_scale: float = 1.0,
     max_iter: int = 1000,
     tol: float = 1e-10,
 ) -> TransactionCostLassoResult:
     """Solve the transaction-cost lasso hedge update by coordinate descent.
 
-    The optimization variable is the new hedge ``phi``. Coordinate descent is
-    run on trade increments ``phi - phi_prev`` so the L1 penalty has the exact
-    transaction-cost interpretation used in the objective.
+    Implements paper eq.(20). The intercept A_t is estimated jointly with phi
+    (unpenalized coordinate). g0_scale = g_0 = V_t scales the L1 penalty so
+    that alpha is dimensionless regardless of portfolio size (paper §3).
+    lambdas use a 1/2 factor because the objective coefficient is 1/N (not
+    1/2N), giving coordinate updates consistent with the paper's formulation.
     """
 
-    y, x, phi_prev_arr, costs, alpha, g0 = _validate_lasso_inputs(
-        target_changes, hedge_changes, phi_prev, c_i, alpha, g0
+    y, x, phi_prev_arr, costs, alpha, g0_scale = _validate_lasso_inputs(
+        target_changes, hedge_changes, phi_prev, c_i, alpha, g0_scale
     )
     max_iter = int(max_iter)
     tol = float(tol)
@@ -823,13 +829,15 @@ def solve_transaction_cost_lasso(
 
     n_scenarios, n_hedges = x.shape
     trade = np.zeros(n_hedges, dtype=float)
-    centered_target = y - g0 - x @ phi_prev_arr
-    residual = centered_target.copy()
-    lambdas = alpha * costs
+    # Initialize A_t (intercept) at the optimal value for phi = phi_prev.
+    intercept = float(np.mean(y - x @ phi_prev_arr))
+    residual = (y - intercept - x @ phi_prev_arr).copy()
+    # lambdas account for the 1/N (vs 1/2N) objective: threshold = alpha*g0*c / 2.
+    lambdas = 0.5 * alpha * g0_scale * costs
     column_norms = np.mean(x * x, axis=0)
 
     objective_history = [
-        transaction_cost_lasso_objective(y, x, phi_prev_arr, phi_prev_arr, costs, alpha, g0)
+        _transaction_cost_lasso_components(y, x, phi_prev_arr, phi_prev_arr, costs, alpha, g0_scale, intercept)[0]
     ]
     converged = False
     max_coordinate_change = np.inf
@@ -837,6 +845,13 @@ def solve_transaction_cost_lasso(
 
     for iteration in range(1, max_iter + 1):
         max_coordinate_change = 0.0
+
+        # Update intercept (unpenalized): optimal given current phi.
+        delta_intercept = float(np.mean(residual))
+        intercept += delta_intercept
+        residual -= delta_intercept
+        max_coordinate_change = max(max_coordinate_change, abs(delta_intercept))
+
         for j in range(n_hedges):
             old_trade = trade[j]
             if column_norms[j] <= np.finfo(float).eps:
@@ -850,10 +865,12 @@ def solve_transaction_cost_lasso(
             max_coordinate_change = max(max_coordinate_change, abs(new_trade - old_trade))
 
         phi = phi_prev_arr + trade
-        objective_value = transaction_cost_lasso_objective(y, x, phi, phi_prev_arr, costs, alpha, g0)
+        objective_value = _transaction_cost_lasso_components(
+            y, x, phi, phi_prev_arr, costs, alpha, g0_scale, intercept
+        )[0]
         objective_history.append(objective_value)
         n_iter = iteration
-        scale = max(1.0, float(np.max(np.abs(phi))))
+        scale = max(1.0, float(np.max(np.abs(phi))), abs(intercept))
         objective_change = abs(objective_history[-2] - objective_history[-1])
         if max_coordinate_change <= tol * scale or objective_change <= tol * scale:
             converged = True
@@ -861,13 +878,14 @@ def solve_transaction_cost_lasso(
 
     phi = phi_prev_arr + trade
     objective_value, fit_loss, transaction_penalty = _transaction_cost_lasso_components(
-        y, x, phi, phi_prev_arr, costs, alpha, g0
+        y, x, phi, phi_prev_arr, costs, alpha, g0_scale, intercept
     )
     return TransactionCostLassoResult(
         phi=phi,
         trade=trade.copy(),
         alpha=alpha,
-        g0=g0,
+        intercept=intercept,
+        g0_scale=g0_scale,
         objective_value=objective_value,
         fit_loss=fit_loss,
         transaction_penalty=transaction_penalty,
@@ -885,13 +903,19 @@ def select_alpha_aic(
     validation_hedge_changes: np.ndarray | Iterable[Iterable[float]],
     phi_prev: np.ndarray | Iterable[float],
     c_i: np.ndarray | Iterable[float],
-    g0: float = 0.0,
+    g0_scale: float = 1.0,
     alpha_grid: np.ndarray | Iterable[float] | None = None,
     max_iter: int = 1000,
     tol: float = 1e-10,
     return_details: bool = False,
 ):
-    """Select alpha by validation AIC over independent validation scenarios."""
+    """Select alpha by validation AIC over independent validation scenarios.
+
+    Paper §4.2 eq.(24): AIC(alpha) = M*log(RSS/M) + 2*(1 + active_instruments)
+    where RSS is computed on M independent validation scenarios using A_t
+    re-estimated on the validation set given phi fitted on training scenarios.
+    The +1 counts the unpenalized intercept A_t as a free parameter.
+    """
 
     if alpha_grid is None:
         alpha_values = np.round(np.arange(0.01, 0.201, 0.01), 2)
@@ -912,6 +936,7 @@ def select_alpha_aic(
     if y_val.shape[0] == 0:
         raise ValueError("at least one validation scenario is required")
 
+    m_val = y_val.shape[0]
     rows = []
     best_row = None
     for alpha in alpha_values:
@@ -921,14 +946,17 @@ def select_alpha_aic(
             phi_prev_arr,
             c_i,
             float(alpha),
-            g0=g0,
+            g0_scale=g0_scale,
             max_iter=max_iter,
             tol=tol,
         )
-        validation_residual = y_val - float(g0) - x_val @ result.phi
+        # Re-estimate A_t on validation set given fitted phi (paper eq.24).
+        val_intercept = float(np.mean(y_val - x_val @ result.phi))
+        validation_residual = y_val - val_intercept - x_val @ result.phi
         validation_mse = float(np.mean(validation_residual * validation_residual))
         active_trades = int(np.count_nonzero(np.abs(result.trade) > 1e-8))
-        aic = y_val.shape[0] * np.log(max(validation_mse, np.finfo(float).tiny)) + 2.0 * active_trades
+        # +1 counts the unpenalized intercept A_t (paper eq.24).
+        aic = m_val * np.log(max(validation_mse, np.finfo(float).tiny)) + 2.0 * (1 + active_trades)
         row = {
             "alpha": float(alpha),
             "aic": float(aic),
@@ -952,22 +980,28 @@ def solver_self_check() -> list[str]:
 
     phi_prev = np.array([0.5, -0.25, 0.1])
     phi_true = np.array([1.25, -0.75, 0.4])
-    g0 = 0.2
-    x_full_rank = np.eye(3)
-    y_full_rank = g0 + x_full_rank @ phi_true
-    ols_phi = np.linalg.lstsq(x_full_rank, y_full_rank - g0, rcond=None)[0]
+    true_intercept = 0.2
+    # Need n > p+1 (overdetermined) for intercept + phi to be jointly identifiable.
+    # Use n=8 scenarios with a random full-rank x; no noise so exact recovery expected.
+    rng = np.random.default_rng(0)
+    x_full_rank = rng.standard_normal((8, 3))
+    y_full_rank = true_intercept + x_full_rank @ phi_true
+    x_aug = np.column_stack([np.ones(8), x_full_rank])
+    lstsq_sol = np.linalg.lstsq(x_aug, y_full_rank, rcond=None)[0]
     ols_result = solve_transaction_cost_lasso(
         y_full_rank,
         x_full_rank,
         phi_prev,
         np.zeros(3),
         alpha=0.0,
-        g0=g0,
-        max_iter=100,
+        g0_scale=1.0,
+        max_iter=500,
         tol=1e-12,
     )
-    if not np.allclose(ols_result.phi, ols_phi, atol=1e-10):
-        failures.append("alpha=0 with zero costs did not match deterministic full-rank OLS")
+    if not np.allclose(ols_result.phi, lstsq_sol[1:], atol=1e-8):
+        failures.append("alpha=0 with zero costs did not match deterministic OLS phi")
+    if not np.isclose(ols_result.intercept, lstsq_sol[0], atol=1e-8):
+        failures.append("alpha=0 with zero costs did not match deterministic OLS intercept")
 
     shrink_x = np.array(
         [
@@ -979,12 +1013,12 @@ def solver_self_check() -> list[str]:
             [0.1, -0.1, 0.9],
         ]
     )
-    shrink_y = g0 + shrink_x @ phi_true
+    shrink_y = true_intercept + shrink_x @ phi_true
     low_alpha = solve_transaction_cost_lasso(
-        shrink_y, shrink_x, phi_prev, np.ones(3), alpha=0.01, g0=g0
+        shrink_y, shrink_x, phi_prev, np.ones(3), alpha=0.01, g0_scale=1.0
     )
     high_alpha = solve_transaction_cost_lasso(
-        shrink_y, shrink_x, phi_prev, np.ones(3), alpha=0.5, g0=g0
+        shrink_y, shrink_x, phi_prev, np.ones(3), alpha=0.5, g0_scale=1.0
     )
     if np.linalg.norm(high_alpha.trade, ord=1) >= np.linalg.norm(low_alpha.trade, ord=1):
         failures.append("larger alpha did not shrink trade increments toward phi_prev")
@@ -998,7 +1032,7 @@ def solver_self_check() -> list[str]:
         np.zeros(2),
         np.array([0.05, 2.0]),
         alpha=0.05,
-        g0=0.0,
+        g0_scale=1.0,
         max_iter=500,
     )
     if abs(cost_result.trade[1]) >= abs(cost_result.trade[0]):
@@ -1011,7 +1045,7 @@ def solver_self_check() -> list[str]:
         failures.append("objective history increased during coordinate descent")
 
     train_x = shrink_x
-    train_y = g0 + train_x @ phi_true + np.array([0.02, -0.01, 0.01, -0.02, 0.0, 0.015])
+    train_y = true_intercept + train_x @ phi_true + np.array([0.02, -0.01, 0.01, -0.02, 0.0, 0.015])
     validation_x = np.array(
         [
             [0.8, 0.1, 0.2],
@@ -1020,7 +1054,7 @@ def solver_self_check() -> list[str]:
             [1.1, -0.1, 0.1],
         ]
     )
-    validation_y = g0 + validation_x @ phi_true + np.array([0.01, -0.015, 0.005, -0.01])
+    validation_y = true_intercept + validation_x @ phi_true + np.array([0.01, -0.015, 0.005, -0.01])
     grid = np.array([0.10, 0.05, 0.01])
     manual_rows = []
     for alpha in grid:
@@ -1030,12 +1064,14 @@ def solver_self_check() -> list[str]:
             phi_prev,
             np.ones(3),
             float(alpha),
-            g0=g0,
+            g0_scale=1.0,
         )
-        validation_residual = validation_y - g0 - validation_x @ result.phi
+        val_intercept = float(np.mean(validation_y - validation_x @ result.phi))
+        validation_residual = validation_y - val_intercept - validation_x @ result.phi
         validation_mse = float(np.mean(validation_residual * validation_residual))
         active_trades = int(np.count_nonzero(np.abs(result.trade) > 1e-8))
-        aic = validation_y.shape[0] * np.log(max(validation_mse, np.finfo(float).tiny)) + 2.0 * active_trades
+        m = validation_y.shape[0]
+        aic = m * np.log(max(validation_mse, np.finfo(float).tiny)) + 2.0 * (1 + active_trades)
         manual_rows.append(
             {
                 "alpha": float(alpha),
@@ -1055,7 +1091,7 @@ def solver_self_check() -> list[str]:
         validation_x,
         phi_prev,
         np.ones(3),
-        g0=g0,
+        g0_scale=1.0,
         alpha_grid=grid,
     )
     if not np.isclose(selected_alpha, expected_alpha):
@@ -1095,6 +1131,8 @@ class DailyBacktestResult:
     transaction_cost: float
     realized_tracking_error_before_cost: float
     realized_tracking_error: float
+    # Paper §2 eq.(6): Z_t = V_t - Pi_t (cumulative from window start, Z_0=0).
+    cumulative_tracking_error: float
 
 
 @dataclass(frozen=True)
@@ -1164,12 +1202,22 @@ def _least_norm_exposure_match(exposures: np.ndarray, target_exposure: np.ndarra
     return np.linalg.lstsq(matrix, target, rcond=None)[0]
 
 
-def benchmark_hedge_positions(current_target: pd.DataFrame, current_hedges: pd.DataFrame) -> BenchmarkHedgePositions:
-    """Return min-norm Greek-matching benchmark positions.
+def benchmark_hedge_positions(
+    current_target: pd.DataFrame,
+    current_hedges: pd.DataFrame,
+    atm_optionid: object = None,
+) -> BenchmarkHedgePositions:
+    """Return Greek-matching benchmark positions.
 
-    Positions are replicating hedge holdings: daily tracking error is measured as
-    long target straddle P&L minus hedge-portfolio P&L, then minus transaction
-    costs paid to move from the previous holdings to the new holdings.
+    delta: min-norm positions matching target delta across all hedge instruments.
+
+    delta_vega: paper §4.4 formula when atm_optionid is provided (preferred):
+      phi_vega = kappa_V / kappa_H  (portfolio vega / ATM option vega)
+      phi_delta = Delta_V - phi_vega * Delta_H  (residual delta via underlying)
+    The ATM option slot in the position vector gets phi_vega; all other slots
+    are zero except the underlying slot (if present) which gets phi_delta.
+    Falls back to min-norm lstsq across all instruments when atm_optionid is
+    None (legacy behaviour retained for backward compatibility).
     """
 
     target_delta = float(pd.to_numeric(current_target['delta'], errors='coerce').sum())
@@ -1177,7 +1225,37 @@ def benchmark_hedge_positions(current_target: pd.DataFrame, current_hedges: pd.D
     hedge_delta = pd.to_numeric(current_hedges['delta'], errors='coerce').to_numpy(dtype=float)
     hedge_vega = pd.to_numeric(current_hedges['vega'], errors='coerce').to_numpy(dtype=float)
     delta_positions = _least_norm_exposure_match(hedge_delta.reshape(1, -1), np.array([target_delta], dtype=float))
-    delta_vega_positions = _least_norm_exposure_match(np.vstack([hedge_delta, hedge_vega]), np.array([target_delta, target_vega], dtype=float))
+
+    if atm_optionid is not None and 'optionid' in current_hedges.columns:
+        atm_mask = (pd.to_numeric(current_hedges['optionid'], errors='coerce') == atm_optionid).to_numpy()
+        if atm_mask.any():
+            atm_idx = int(np.argmax(atm_mask))
+            kappa_h = float(hedge_vega[atm_idx])
+            delta_h = float(hedge_delta[atm_idx])
+            if abs(kappa_h) > np.finfo(float).eps:
+                phi_vega = target_vega / kappa_h
+                phi_delta_under = target_delta - phi_vega * delta_h
+                dv_positions = np.zeros(len(current_hedges), dtype=float)
+                dv_positions[atm_idx] = phi_vega
+                # Distribute remaining delta to the nearest-to-ATM instrument
+                # (approximation when no explicit underlying row is present).
+                under_mask = current_hedges.get('role', pd.Series(dtype=str)) == 'underlying'
+                if under_mask.any():
+                    dv_positions[under_mask.to_numpy().argmax()] = phi_delta_under
+                else:
+                    # Spread residual delta proportionally across non-ATM instruments.
+                    other_mask = ~atm_mask
+                    if other_mask.any() and abs(hedge_delta[other_mask]).sum() > np.finfo(float).eps:
+                        weights = np.abs(hedge_delta[other_mask]) / np.abs(hedge_delta[other_mask]).sum()
+                        dv_positions[other_mask] = phi_delta_under * weights
+                delta_vega_positions = dv_positions
+            else:
+                delta_vega_positions = _least_norm_exposure_match(np.vstack([hedge_delta, hedge_vega]), np.array([target_delta, target_vega], dtype=float))
+        else:
+            delta_vega_positions = _least_norm_exposure_match(np.vstack([hedge_delta, hedge_vega]), np.array([target_delta, target_vega], dtype=float))
+    else:
+        delta_vega_positions = _least_norm_exposure_match(np.vstack([hedge_delta, hedge_vega]), np.array([target_delta, target_vega], dtype=float))
+
     return BenchmarkHedgePositions(delta=delta_positions, delta_vega=delta_vega_positions)
 
 
@@ -1236,6 +1314,7 @@ def _result_row(result: DailyBacktestResult) -> dict[str, object]:
         'realized_tracking_error_before_cost': result.realized_tracking_error_before_cost,
         'realized_tracking_error': result.realized_tracking_error,
         'abs_realized_tracking_error': abs(result.realized_tracking_error),
+        'cumulative_tracking_error': result.cumulative_tracking_error,
     }
 
 
@@ -1253,6 +1332,7 @@ def _daily_result(
     hedge_delta: np.ndarray,
     hedge_vega: np.ndarray,
     half_spreads: np.ndarray,
+    prev_cumulative_z: float = 0.0,
 ) -> DailyBacktestResult:
     trade = positions - previous_positions
     hedge_change = float(hedge_changes @ positions)
@@ -1260,6 +1340,7 @@ def _daily_result(
     hedge_vega_exposure = float(hedge_vega @ positions)
     transaction_cost = float(np.sum(half_spreads * np.abs(trade)))
     before_cost = float(target_change - hedge_change)
+    realized_te = float(before_cost - transaction_cost)
     return DailyBacktestResult(
         start_date=_as_timestamp(start_date),
         end_date=_as_timestamp(end_date),
@@ -1277,7 +1358,8 @@ def _daily_result(
         vega_residual=float(target_vega - hedge_vega_exposure),
         transaction_cost=transaction_cost,
         realized_tracking_error_before_cost=before_cost,
-        realized_tracking_error=float(before_cost - transaction_cost),
+        realized_tracking_error=realized_te,
+        cumulative_tracking_error=prev_cumulative_z + realized_te,
     )
 
 
@@ -1286,6 +1368,7 @@ def run_daily_backtest(
     scenario_source: object,
     alpha_grid: np.ndarray | Iterable[float] | None = None,
     strategies: tuple[str, ...] = ('lasso', 'delta', 'delta_vega'),
+    fixed_alpha: float | None = None,
 ) -> BacktestSummary:
     """Run model-free daily hedging mechanics over adjacent panel dates.
 
@@ -1293,6 +1376,12 @@ def run_daily_backtest(
     positions are replicating hedge holdings, so signed realized tracking error is
     target straddle mid-price change minus hedge-portfolio mid-price change minus
     transaction costs from the rebalance trade.
+
+    fixed_alpha: if provided, skip per-day AIC selection and use this alpha for
+    all 21 rebalancing days (paper §4.2: alpha selected once at window open).
+    The caller is responsible for selecting alpha via select_alpha_aic before
+    calling this function with the paper's N=1000 fit + M=100 validation split.
+    When None, alpha is re-selected each day from a 70/30 split (legacy mode).
     """
 
     requested = tuple(str(strategy) for strategy in strategies)
@@ -1305,6 +1394,8 @@ def run_daily_backtest(
 
     n_hedges = len(panel.hedges)
     previous_positions = {strategy: np.zeros(n_hedges, dtype=float) for strategy in requested}
+    # Z_t = V_t - Pi_t (paper §2 eq.6); accumulated daily within each window.
+    cumulative_z: dict[str, float] = {strategy: 0.0 for strategy in requested}
     rows = []
     skipped_frames = []
 
@@ -1325,32 +1416,53 @@ def run_daily_backtest(
         hedge_vega = pd.to_numeric(current_hedges['vega'], errors='coerce').to_numpy(dtype=float)
         target_change = float(np.sum(next_target_mid - current_target_mid))
         hedge_changes = next_hedge_mid - current_hedge_mid
+        # g_0 = V_t = current portfolio value (paper eq.20 penalty scaling).
+        g0_scale = float(np.sum(current_target_mid))
+        if g0_scale <= 0:
+            g0_scale = 1.0
 
         if 'lasso' in requested:
             scenario_output = _scenario_source_output(scenario_source, panel, start_date, end_date, current_target, current_hedges)
-            train, validation = _adapt_train_validation_scenarios(scenario_output)
-            alpha, lasso_result, _ = select_alpha_aic(
-                train.target_changes,
-                train.hedge_changes,
-                validation.target_changes,
-                validation.hedge_changes,
-                previous_positions['lasso'],
-                half_spreads,
-                alpha_grid=alpha_grid,
-                return_details=True,
-            )
-            daily = _daily_result(start_date, end_date, 'lasso', lasso_result.phi, previous_positions['lasso'], float(alpha), target_change, hedge_changes, target_delta, target_vega, hedge_delta, hedge_vega, half_spreads)
+            if fixed_alpha is not None:
+                # Paper §4.2: alpha fixed for entire window; solve directly.
+                scenarios = adapt_scenarios_to_solver(scenario_output)
+                lasso_result = solve_transaction_cost_lasso(
+                    scenarios.target_changes,
+                    scenarios.hedge_changes,
+                    previous_positions['lasso'],
+                    half_spreads,
+                    float(fixed_alpha),
+                    g0_scale=g0_scale,
+                )
+                alpha_used = float(fixed_alpha)
+            else:
+                # Legacy: reselect alpha each day using 70/30 split.
+                train, validation = _adapt_train_validation_scenarios(scenario_output)
+                alpha_used, lasso_result, _ = select_alpha_aic(
+                    train.target_changes,
+                    train.hedge_changes,
+                    validation.target_changes,
+                    validation.hedge_changes,
+                    previous_positions['lasso'],
+                    half_spreads,
+                    g0_scale=g0_scale,
+                    alpha_grid=alpha_grid,
+                    return_details=True,
+                )
+            daily = _daily_result(start_date, end_date, 'lasso', lasso_result.phi, previous_positions['lasso'], alpha_used, target_change, hedge_changes, target_delta, target_vega, hedge_delta, hedge_vega, half_spreads, cumulative_z['lasso'])
             rows.append(_result_row(daily))
             previous_positions['lasso'] = lasso_result.phi.copy()
+            cumulative_z['lasso'] = daily.cumulative_tracking_error
 
         if 'delta' in requested or 'delta_vega' in requested:
             benchmarks = benchmark_hedge_positions(current_target, current_hedges)
             for strategy, positions in (('delta', benchmarks.delta), ('delta_vega', benchmarks.delta_vega)):
                 if strategy not in requested:
                     continue
-                daily = _daily_result(start_date, end_date, strategy, positions, previous_positions[strategy], None, target_change, hedge_changes, target_delta, target_vega, hedge_delta, hedge_vega, half_spreads)
+                daily = _daily_result(start_date, end_date, strategy, positions, previous_positions[strategy], None, target_change, hedge_changes, target_delta, target_vega, hedge_delta, hedge_vega, half_spreads, cumulative_z[strategy])
                 rows.append(_result_row(daily))
                 previous_positions[strategy] = positions.copy()
+                cumulative_z[strategy] = daily.cumulative_tracking_error
 
     skipped = pd.concat(skipped_frames, ignore_index=True) if skipped_frames else pd.DataFrame()
     results = pd.DataFrame(rows)
@@ -1390,7 +1502,13 @@ def _one_dimensional_array(value: object) -> np.ndarray:
 
 
 def tracking_error_summary(summary: BacktestSummary) -> pd.DataFrame:
-    """Return realized tracking-error moments by strategy."""
+    """Return realized tracking-error moments by strategy.
+
+    Columns prefixed 'terminal_' report statistics over the last observed
+    cumulative_tracking_error per window (Z_T in paper §2 eq.6). For a single
+    one-month panel there is one terminal value per strategy; for the full
+    52-window backtest these columns give the paper's Table 2 statistics.
+    """
 
     columns = [
         'strategy',
@@ -1400,6 +1518,12 @@ def tracking_error_summary(summary: BacktestSummary) -> pd.DataFrame:
         'tracking_rmse',
         'tracking_std',
         'before_cost_tracking_rmse',
+        'terminal_count',
+        'terminal_mean',
+        'terminal_std',
+        'terminal_var_5pct',
+        'terminal_var_2_5pct',
+        'terminal_var_1pct',
     ]
     results = summary.results
     if results.empty or 'strategy' not in results.columns or 'realized_tracking_error' not in results.columns:
@@ -1413,7 +1537,22 @@ def tracking_error_summary(summary: BacktestSummary) -> pd.DataFrame:
             before_cost = _finite_array(pd.to_numeric(group['realized_tracking_error_before_cost'], errors='coerce').to_numpy(dtype=float))
             if before_cost.size == errors.size:
                 before_cost_rmse = _rmse(before_cost)
-        rows.append({
+
+        # Terminal Z_T: last cumulative value per (start_date) window.
+        terminal_z = np.array([], dtype=float)
+        if 'cumulative_tracking_error' in group.columns and 'end_date' in group.columns:
+            g = group.copy()
+            g['end_date'] = pd.to_datetime(g['end_date'])
+            # Last row per window = row with max end_date per window-start group.
+            # For a single-panel backtest the last row is the only terminal value.
+            if 'start_date' in g.columns:
+                g['start_date'] = pd.to_datetime(g['start_date'])
+                last_rows = g.loc[g.groupby('start_date')['end_date'].idxmax()]
+            else:
+                last_rows = g.iloc[[-1]]
+            terminal_z = _finite_array(pd.to_numeric(last_rows['cumulative_tracking_error'], errors='coerce').to_numpy(dtype=float))
+
+        row = {
             'strategy': strategy,
             'tracking_count': int(errors.size),
             'mean_signed_tracking_error': float(np.mean(errors)) if errors.size else float('nan'),
@@ -1421,7 +1560,14 @@ def tracking_error_summary(summary: BacktestSummary) -> pd.DataFrame:
             'tracking_rmse': _rmse(errors),
             'tracking_std': float(np.std(errors, ddof=0)) if errors.size else float('nan'),
             'before_cost_tracking_rmse': before_cost_rmse,
-        })
+            'terminal_count': int(terminal_z.size),
+            'terminal_mean': float(np.mean(terminal_z)) if terminal_z.size else float('nan'),
+            'terminal_std': float(np.std(terminal_z, ddof=0)) if terminal_z.size > 1 else float('nan'),
+            'terminal_var_5pct': float(np.percentile(terminal_z, 5)) if terminal_z.size else float('nan'),
+            'terminal_var_2_5pct': float(np.percentile(terminal_z, 2.5)) if terminal_z.size else float('nan'),
+            'terminal_var_1pct': float(np.percentile(terminal_z, 1)) if terminal_z.size else float('nan'),
+        }
+        rows.append(row)
     return _strategy_sort_frame(pd.DataFrame(rows, columns=columns))
 
 
@@ -1565,6 +1711,157 @@ def strategy_comparison_table(summary: BacktestSummary) -> pd.DataFrame:
     return _strategy_sort_frame(combined)
 
 
+def run_full_backtest(
+    window_start_dates: list[pd.Timestamp],
+    m0_list: list[float],
+    scenario_source: object,
+    data_dir: Path = DATA_DIR,
+    n_fit: int = 1000,
+    n_val: int = 100,
+    alpha_grid: np.ndarray | None = None,
+    strategies: tuple[str, ...] = ('lasso', 'delta', 'delta_vega'),
+    target_days: int = 23,
+) -> pd.DataFrame:
+    """Run 52-window paper backtest and return terminal Z_T per window and m0.
+
+    Paper §4.2 protocol:
+    - alpha selected once at t=0 per window using n_fit fitting + n_val validation
+      scenarios (independent draws from scenario_source).
+    - The same alpha is held fixed for all 21 rebalancing days in the window.
+    - Terminal Z_T = cumulative tracking error at window expiry.
+
+    The scenario_source must support a two-key dict return for alpha selection:
+      {'train': <scenario_type>, 'validation': <scenario_type>}
+    or provide ``alpha_scenarios_for_window(panel)`` returning that dict.
+    Otherwise the alpha-selection call falls back to a 70/30 split of the
+    first scenario draw (legacy behaviour, not paper-compliant).
+
+    Returns a DataFrame with columns:
+      window_start, expiry, m0, strategy, terminal_Z_T, skipped_intervals
+    One row per (window, m0, strategy).
+    """
+
+    rows_out = []
+    for window_start in window_start_dates:
+        for m0 in m0_list:
+            try:
+                panel = build_instrument_panel(
+                    start_date=window_start,
+                    m0=m0,
+                    data_dir=data_dir,
+                    target_days=target_days,
+                )
+            except Exception as exc:
+                rows_out.append({
+                    'window_start': _as_timestamp(window_start),
+                    'expiry': pd.NaT,
+                    'm0': m0,
+                    'strategy': None,
+                    'terminal_Z_T': float('nan'),
+                    'skipped_intervals': -1,
+                    'error': str(exc),
+                })
+                continue
+
+            # Alpha selection at t=0: draw n_fit + n_val independent scenarios.
+            fixed_alphas: dict[str, float | None] = {s: None for s in strategies}
+            if 'lasso' in strategies:
+                first_date = panel.trading_dates[0]
+                second_date = panel.trading_dates[1] if len(panel.trading_dates) > 1 else first_date
+                current_target_rows = panel.quotes[
+                    (panel.quotes['date'] == first_date) & (panel.quotes['optionid'].isin(panel.target['optionid']))
+                ].drop_duplicates('optionid').set_index('optionid').reindex(panel.target['optionid'])
+                current_hedge_rows = panel.quotes[
+                    (panel.quotes['date'] == first_date) & (panel.quotes['optionid'].isin(panel.hedges['optionid']))
+                ].drop_duplicates('optionid').set_index('optionid').reindex(panel.hedges['optionid'])
+
+                try:
+                    if hasattr(scenario_source, 'alpha_scenarios_for_window'):
+                        alpha_output = scenario_source.alpha_scenarios_for_window(panel)
+                    else:
+                        # Draw combined n_fit + n_val scenarios; split by count.
+                        alpha_output = _scenario_source_output(
+                            scenario_source, panel, first_date, second_date,
+                            current_target_rows.reset_index(), current_hedge_rows.reset_index(),
+                        )
+
+                    if isinstance(alpha_output, Mapping) and ('train' in alpha_output or 'training' in alpha_output):
+                        train_arr, val_arr = _adapt_train_validation_scenarios(alpha_output)
+                    else:
+                        combined = adapt_scenarios_to_solver(alpha_output)
+                        n_total = combined.target_changes.shape[0]
+                        n_train = min(n_fit, n_total - 1)
+                        train_arr = SolverScenarioArrays(
+                            target_changes=combined.target_changes[:n_train],
+                            hedge_changes=combined.hedge_changes[:n_train],
+                        )
+                        val_arr = SolverScenarioArrays(
+                            target_changes=combined.target_changes[n_train:],
+                            hedge_changes=combined.hedge_changes[n_train:],
+                        )
+
+                    half_spreads = pd.to_numeric(
+                        current_hedge_rows['half_spread'], errors='coerce'
+                    ).fillna(0.0).to_numpy(dtype=float)
+                    current_target_mid = pd.to_numeric(
+                        current_target_rows['mid_price'], errors='coerce'
+                    ).fillna(0.0).to_numpy(dtype=float)
+                    g0_scale = float(np.sum(current_target_mid))
+                    if g0_scale <= 0:
+                        g0_scale = 1.0
+
+                    selected_alpha = select_alpha_aic(
+                        train_arr.target_changes,
+                        train_arr.hedge_changes,
+                        val_arr.target_changes,
+                        val_arr.hedge_changes,
+                        np.zeros(len(panel.hedges), dtype=float),
+                        half_spreads,
+                        g0_scale=g0_scale,
+                        alpha_grid=alpha_grid,
+                    )
+                    fixed_alphas['lasso'] = selected_alpha
+                except Exception:
+                    fixed_alphas['lasso'] = None  # fall back to per-day selection
+
+            summary = run_daily_backtest(
+                panel,
+                scenario_source,
+                alpha_grid=alpha_grid,
+                strategies=strategies,
+                fixed_alpha=fixed_alphas.get('lasso'),
+            )
+
+            # Extract terminal Z_T (cumulative tracking error at expiry).
+            if summary.results.empty:
+                for strategy in strategies:
+                    rows_out.append({
+                        'window_start': panel.start_date,
+                        'expiry': panel.expiry_date,
+                        'm0': m0,
+                        'strategy': strategy,
+                        'terminal_Z_T': float('nan'),
+                        'skipped_intervals': summary.skipped_interval_count,
+                        'error': 'no_results',
+                    })
+                continue
+
+            for strategy, group in summary.results.groupby('strategy', sort=False):
+                group = group.sort_values('end_date')
+                terminal_z = float(group.iloc[-1]['cumulative_tracking_error']) if 'cumulative_tracking_error' in group.columns else float('nan')
+                rows_out.append({
+                    'window_start': panel.start_date,
+                    'expiry': panel.expiry_date,
+                    'm0': m0,
+                    'strategy': strategy,
+                    'terminal_Z_T': terminal_z,
+                    'skipped_intervals': summary.skipped_interval_count,
+                    'error': None,
+                })
+
+    return pd.DataFrame(rows_out)
+
+
 class DeterministicBacktestScenarioSource:
     """Test-only scenario source for backtest mechanics; no generator required."""
 
@@ -1613,7 +1910,7 @@ def backtest_self_check() -> list[str]:
         failures.append('backtest did not emit all expected strategies')
     if summary.results.empty:
         return failures
-    numeric_columns = ['target_change', 'hedge_change', 'target_delta', 'target_vega', 'hedge_delta_exposure', 'hedge_vega_exposure', 'delta_residual', 'vega_residual', 'transaction_cost', 'realized_tracking_error_before_cost', 'realized_tracking_error']
+    numeric_columns = ['target_change', 'hedge_change', 'target_delta', 'target_vega', 'hedge_delta_exposure', 'hedge_vega_exposure', 'delta_residual', 'vega_residual', 'transaction_cost', 'realized_tracking_error_before_cost', 'realized_tracking_error', 'cumulative_tracking_error']
     for column in numeric_columns:
         if not np.all(np.isfinite(summary.results[column].to_numpy(dtype=float))):
             failures.append(f'{column} contains non-finite values')
@@ -1623,6 +1920,12 @@ def backtest_self_check() -> list[str]:
     expected_net = float(first['target_change']) - float(first['hedge_change']) - float(first['transaction_cost'])
     if not np.isclose(float(first['realized_tracking_error']), expected_net):
         failures.append('realized tracking error does not match documented sign convention')
+    if 'cumulative_tracking_error' not in summary.results.columns:
+        failures.append('cumulative_tracking_error column missing from backtest results')
+    else:
+        # For a single interval the cumulative Z equals the daily increment.
+        if not np.isclose(float(first['cumulative_tracking_error']), float(first['realized_tracking_error'])):
+            failures.append('cumulative_tracking_error does not equal realized_tracking_error for the first interval')
     if summary.skipped_intervals.empty or 'missing_quote' not in set(summary.skipped_intervals['reason']):
         failures.append('skipped interval table did not preserve missing quote reason')
     return failures
@@ -1666,6 +1969,7 @@ def paper_output_self_check() -> list[str]:
         'hedge_vega_exposure',
         'delta_residual',
         'vega_residual',
+        'cumulative_tracking_error',
     }
     missing_columns = sorted(required_result_columns.difference(summary.results.columns))
     if missing_columns:
