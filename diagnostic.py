@@ -1,4 +1,5 @@
 import sys, types, numpy as np, pandas as pd, torch
+from pathlib import Path
 sys.path.insert(0, ".")
 sys.path.insert(0, "../VolGAN")
 
@@ -17,7 +18,7 @@ from volgan_adapter import MONEYNESS_GRID, TAU_GRID
 # Build one panel
 panel = build_instrument_panel(
     "2018-07-01", m0=0.9,
-    data_dir="data/VolGAN_optionmetrics_spx_20000103_20230228"
+    data_dir=Path("data/VolGAN_optionmetrics_spx_20000103_20230228")
 )
 t0 = panel.trading_dates[0]
 print(f"t0={t0}  n_trading_days={len(panel.trading_dates)}")
